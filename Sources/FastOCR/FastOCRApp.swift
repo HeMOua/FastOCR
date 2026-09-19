@@ -1,0 +1,299 @@
+import AppKit
+import SwiftUI
+import OCRCore
+import OSLog
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var status: NSStatusItem!
+    private let hotkey = GlobalHotkey()
+    private let capture = CaptureCoordinator()
+    private let engine: any OCREngine = VisionOCREngine()
+    private var busy = false
+    private var preparing = false
+    private var captureTask: Task<Void, Never>?
+    private let logger = Logger(subsystem: "com.chenchao.FastOCR", category: "performance")
+    private var latest: OCRResult?
+    private var resultWindow: NSWindow?
+    private var hud: NSPanel?
+    private var hudTask: Task<Void, Never>?
+    private var captureScreen: NSScreen?
+    private var previousApp: NSRunningApplication?
+    private var captureItem: NSMenuItem!
+    private var resultItem: NSMenuItem!
+    private var screenObserver: NSObjectProtocol?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+        if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+           let icon = NSImage(contentsOf: iconURL) {
+            NSApp.applicationIconImage = icon
+        }
+        status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        status.button?.image = NSImage(systemSymbolName: "text.viewfinder", accessibilityDescription: "FastOCR")
+        status.button?.toolTip = "FastOCR · ⌘⇧O 框选识别"
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        let title = NSMenuItem(title: "FastOCR · 屏幕文字，一框即得", action: nil, keyEquivalent: "")
+        title.isEnabled = false
+        menu.addItem(title)
+        menu.addItem(.separator())
+        captureItem = item("框选识别", #selector(startCapture), key: "o")
+        captureItem.keyEquivalentModifierMask = [.command, .shift]
+        menu.addItem(captureItem)
+        resultItem = item("查看上次结果…", #selector(showResult))
+        resultItem.isEnabled = false
+        menu.addItem(resultItem)
+        let copy = item("识别后自动复制", #selector(toggleCopy))
+        copy.state = autoCopy ? .on : .off
+        menu.addItem(copy)
+        menu.addItem(.separator())
+        menu.addItem(item("屏幕录制权限…", #selector(openPermissions)))
+        menu.addItem(item("关于 FastOCR", #selector(showAbout)))
+        menu.addItem(.separator())
+        menu.addItem(item("退出 FastOCR", #selector(quit), key: "q"))
+        status.menu = menu
+        hotkey.onPress = { [weak self] in self?.startCapture() }
+        if !hotkey.register() {
+            showAlert("快捷键注册失败", "⌘⇧O 可能已被其他应用占用。你仍可通过菜单栏的「框选识别」使用 FastOCR。")
+        }
+        screenObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.captureTask?.cancel(); self?.capture.cancel() }
+            }
+        if !UserDefaults.standard.bool(forKey: "hasLaunched") {
+            UserDefaults.standard.set(true, forKey: "hasLaunched")
+            showAlert("欢迎使用 FastOCR", "按 ⌘⇧O 或点击菜单栏图标开始框选文字。\n\n首次使用需要允许屏幕录制。识别在本机完成，默认自动复制；Esc 取消选区。")
+        }
+    }
+    private var autoCopy: Bool {
+        UserDefaults.standard.object(forKey: "autoCopy") as? Bool ?? true
+    }
+    private func item(_ title: String, _ action: Selector, key: String = "") -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.target = self
+        return item
+    }
+    @objc private func toggleCopy(_ sender: NSMenuItem) {
+        UserDefaults.standard.set(!autoCopy, forKey: "autoCopy")
+        sender.state = autoCopy ? .on : .off
+    }
+    @objc private func startCapture() {
+        guard !busy else {
+            logger.info("trigger_ignored_busy")
+            if preparing { status.button?.title = " 准备中…" }
+            return
+        }
+        let triggerTime = ProcessInfo.processInfo.systemUptime
+        guard CGPreflightScreenCaptureAccess() else {
+            CGRequestScreenCaptureAccess()
+            let alert = NSAlert()
+            alert.messageText = "需要屏幕录制权限"
+            alert.informativeText = "请在系统设置中允许 FastOCR 录制屏幕，然后重新启动 FastOCR。应用仅在你触发识别时读取屏幕，图片不会保存或上传。"
+            alert.addButton(withTitle: "打开系统设置")
+            alert.addButton(withTitle: "稍后")
+            NSApp.activate(ignoringOtherApps: true)
+            if alert.runModal() == .alertFirstButtonReturn { openPermissions() }
+            return
+        }
+        previousApp = NSWorkspace.shared.frontmostApplication
+        setBusy(true)
+        preparing = true
+        status.button?.title = " 准备中…"
+        hudTask?.cancel()
+        hud?.orderOut(nil)
+        resultWindow?.orderOut(nil)
+        captureTask = Task {
+            do {
+                // Allow the menu action to finish; no fixed delay for hotkeys.
+                await Task.yield()
+                let snapshots = try await capture.prepare()
+                try Task.checkCancellation()
+                preparing = false
+                status.button?.title = ""
+                logger.info("selection_ready_ms=\((ProcessInfo.processInfo.systemUptime - triggerTime) * 1000)")
+                capture.select(snapshots) { [weak self] outcome in
+                    guard let self else { return }
+                    self.captureScreen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) }
+                    self.previousApp?.activate(options: [])
+                    switch outcome {
+                    case .success(let image):
+                        guard let image else { self.setBusy(false); return }
+                        self.recognize(image)
+                    case .failure(let error):
+                        self.setBusy(false)
+                        self.logger.error("crop_failed")
+                        self.showAlert("无法识别选区", error.localizedDescription)
+                    }
+                }
+            } catch is CancellationError {
+                setBusy(false)
+            } catch {
+                setBusy(false)
+                logger.error("capture_failed")
+                showAlert("无法截取屏幕", error.localizedDescription + "\n请检查屏幕录制权限，授权后尝试退出并重新打开应用。")
+            }
+        }
+    }
+    private func recognize(_ image: CGImage) {
+        let shouldCopy = autoCopy
+        showHUD("正在识别，请稍候粘贴…", symbol: "text.viewfinder", seconds: nil)
+        Task {
+            do {
+                let result = try await engine.recognize(image: image)
+                defer { setBusy(false) }
+                logger.info("ocr_ms=\(result.duration * 1000) blocks=\(result.blocks.count)")
+                guard !result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    showHUD("未发现文字，请重新框选", symbol: "text.magnifyingglass")
+                    return
+                }
+                latest = result
+                resultItem.isEnabled = true
+                if shouldCopy {
+                    if copyText(result.text) {
+                        showHUD("已复制 \(result.text.count) 个字符", symbol: "checkmark.circle.fill", preview: result.text, seconds: 6)
+                    } else {
+                        showHUD("复制失败，请从结果窗口复制", symbol: "exclamationmark.triangle", preview: result.text, seconds: 6)
+                        showResult()
+                    }
+                } else {
+                    showHUD("识别完成 · \(result.text.count) 个字符", symbol: "checkmark.circle.fill", preview: result.text, seconds: 6)
+                    showResult()
+                }
+            } catch {
+                setBusy(false)
+                hud?.orderOut(nil)
+                showAlert("文字识别失败", error.localizedDescription)
+            }
+        }
+    }
+    private func setBusy(_ value: Bool) {
+        busy = value
+        if !value { preparing = false }
+        status.button?.title = value ? " 识别中…" : ""
+        captureItem.isEnabled = !value
+        captureItem.title = value ? "正在处理…" : "框选识别"
+        status.button?.appearsDisabled = value
+    }
+    @discardableResult private func copyText(_ text: String) -> Bool {
+        let start = ProcessInfo.processInfo.systemUptime
+        let success = ClipboardService.copy(text)
+        logger.info("clipboard_success=\(success) clipboard_ms=\((ProcessInfo.processInfo.systemUptime - start) * 1000)")
+        return success
+    }
+    @objc private func showResult() {
+        guard let latest else { return }
+        if resultWindow == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 460),
+                                  styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+            window.title = "FastOCR · 识别结果"
+            window.minSize = NSSize(width: 420, height: 280)
+            window.isReleasedWhenClosed = false
+            window.center()
+            resultWindow = window
+        }
+        resultWindow?.contentView = NSHostingView(rootView: ResultView(result: latest, copy: { [weak self] in self?.copyText($0) ?? false }).id(UUID()))
+        NSApp.activate(ignoringOtherApps: true)
+        resultWindow?.makeKeyAndOrderFront(nil)
+    }
+    private func showHUD(_ text: String, symbol: String, preview: String? = nil, seconds: Double? = 2) {
+        hudTask?.cancel()
+        hud?.orderOut(nil)
+        let width: CGFloat = preview == nil ? 330 : 380
+        let height: CGFloat = preview == nil ? 72 : 210
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+                            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.level = .statusBar
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.ignoresMouseEvents = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.contentView = NSHostingView(rootView:
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 12) {
+                    Image(systemName: symbol).font(.system(size: 23)).foregroundStyle(.blue)
+                    Text(text).font(.system(size: 14, weight: .medium))
+                    Spacer(minLength: 0)
+                }
+                if let preview {
+                    Divider()
+                    Text(String(preview.prefix(600)))
+                        .font(.system(size: 13)).lineSpacing(3)
+                        .lineLimit(4).truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Spacer(minLength: 0)
+                    Text("菜单栏 → 查看上次结果，可阅读完整内容")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+            }.padding(20).frame(width: width, height: height, alignment: .topLeading)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16)))
+        if let screen = captureScreen ?? NSScreen.main {
+            panel.setFrameOrigin(NSPoint(x: screen.visibleFrame.maxX - width - 24, y: screen.visibleFrame.minY + 24))
+        }
+        panel.orderFrontRegardless()
+        hud = panel
+        if let seconds {
+            hudTask = Task { [weak panel] in
+                do { try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000)) }
+                catch { return }
+                panel?.orderOut(nil)
+            }
+        }
+    }
+    @objc private func openPermissions() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+    @objc private func showAbout() {
+        showAlert("FastOCR " + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.1"), "屏幕文字，一框即得。\n\n⌘⇧O：框选识别\nEsc：取消\n支持中英文、Retina 和多显示器（在单个屏幕内框选）。\n\n基于 Apple Vision，本地识别。只在内存保留上次成功结果，退出即清除。")
+    }
+    private func showAlert(_ title: String, _ message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+    @objc private func quit() { NSApp.terminate(nil) }
+}
+struct ResultView: View {
+    let result: OCRResult
+    let copy: (String) -> Bool
+    @State private var copyFailed = false
+    @State private var copied = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Image(systemName: "text.viewfinder").font(.title).foregroundStyle(.blue)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("识别结果").font(.title2.bold())
+                    Text("\(result.text.count) 个字符 · \(result.blocks.count) 个文本块 · \(String(format: "%.2f", result.duration)) 秒")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button(copied ? "已复制" : "复制全文") {
+                    copied = copy(result.text)
+                    copyFailed = !copied
+                }.buttonStyle(.borderedProminent)
+            }
+            ScrollView {
+                Text(result.text).font(.system(size: 15)).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .topLeading).padding(16)
+            }.background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+            Text("内容仅保留在本次运行中 · ⌘⇧O 继续识别").font(.caption).foregroundStyle(.secondary)
+        }.padding(24).frame(minWidth: 380, minHeight: 240)
+        .alert("复制失败", isPresented: $copyFailed) {
+            Button("好", role: .cancel) {}
+        } message: { Text("剪贴板写入或校验失败，请重试复制。识别结果仍保留在窗口中。") }
+    }
+}
+@main
+struct FastOCRApplication {
+    @MainActor static func main() {
+        let application = NSApplication.shared
+        let delegate = AppDelegate()
+        application.delegate = delegate
+        withExtendedLifetime(delegate) { application.run() }
+    }
+}
