@@ -11,7 +11,7 @@ enum CaptureError: LocalizedError {
     case noDisplays, cropFailed
     var errorDescription: String? {
         switch self {
-        case .noDisplays: return "没有找到可捕获的显示器，请检查屏幕录制权限。"
+        case .noDisplays: return "没有找到匹配的可捕获显示器，请确认显示器连接后重试。"
         case .cropFailed: return "选区太小或已超出屏幕，请重新框选。"
         }
     }

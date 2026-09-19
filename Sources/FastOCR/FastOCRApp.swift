@@ -8,6 +8,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var status: NSStatusItem!
     private let hotkey = GlobalHotkey()
     private let capture = CaptureCoordinator()
+    private let permission = ScreenRecordingPermissionService()
+    private var permissionUIActive = false
+    private var permissionItem: NSMenuItem!
     private let engine: any OCREngine = VisionOCREngine()
     private var busy = false
     private var preparing = false
@@ -48,11 +51,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         copy.state = autoCopy ? .on : .off
         menu.addItem(copy)
         menu.addItem(.separator())
-        menu.addItem(item("屏幕录制权限…", #selector(openPermissions)))
+        permissionItem = item("屏幕录制权限…", #selector(showPermissions))
+        menu.addItem(permissionItem)
+        menu.addItem(item("在 Finder 中定位当前应用", #selector(revealApplication)))
         menu.addItem(item("关于 FastOCR", #selector(showAbout)))
         menu.addItem(.separator())
         menu.addItem(item("退出 FastOCR", #selector(quit), key: "q"))
         status.menu = menu
+        refreshPermission()
         hotkey.onPress = { [weak self] in self?.startCapture() }
         if !hotkey.register() {
             showAlert("快捷键注册失败", "⌘⇧O 可能已被其他应用占用。你仍可通过菜单栏的「框选识别」使用 FastOCR。")
@@ -85,16 +91,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         let triggerTime = ProcessInfo.processInfo.systemUptime
-        guard CGPreflightScreenCaptureAccess() else {
-            CGRequestScreenCaptureAccess()
-            let alert = NSAlert()
-            alert.messageText = "需要屏幕录制权限"
-            alert.informativeText = "请在系统设置中允许 FastOCR 录制屏幕，然后重新启动 FastOCR。应用仅在你触发识别时读取屏幕，图片不会保存或上传。"
-            alert.addButton(withTitle: "打开系统设置")
-            alert.addButton(withTitle: "稍后")
-            NSApp.activate(ignoringOtherApps: true)
-            if alert.runModal() == .alertFirstButtonReturn { openPermissions() }
-            return
+        guard !permissionUIActive, !permission.requesting else { return }
+        if !permission.refresh() {
+            permissionUIActive = true
+            defer { permissionUIActive = false; refreshPermission() }
+            if !permission.requestedThisSession, permission.request() {
+                // This user-triggered request is now allowed to continue to capture.
+            } else {
+                presentPermissionGuidance()
+                return
+            }
         }
         previousApp = NSWorkspace.shared.frontmostApplication
         setBusy(true)
@@ -131,7 +137,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } catch {
                 setBusy(false)
                 logger.error("capture_failed")
-                showAlert("无法截取屏幕", error.localizedDescription + "\n请检查屏幕录制权限，授权后尝试退出并重新打开应用。")
+                refreshPermission()
+                if permission.status == .unavailable {
+                    showPermissions()
+                } else {
+                    showAlert("截图失败", error.localizedDescription + "\n权限检查已通过，但本次捕获未成功。请重试；若刚修改授权后持续失败，可先复制需保留的结果，再退出并重新打开 FastOCR。")
+                }
             }
         }
     }
@@ -240,9 +251,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
     }
-    @objc private func openPermissions() {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
-            NSWorkspace.shared.open(url)
+    func applicationDidBecomeActive(_ notification: Notification) {
+        // Returning from Settings updates status only; never starts capture.
+        guard permissionItem != nil else { return }
+        refreshPermission()
+    }
+    private func refreshPermission() {
+        let ready = permission.refresh()
+        permissionItem?.title = ready ? "屏幕录制：已授权…" : "屏幕录制：尚未获得权限…"
+    }
+    @objc private func showPermissions() {
+        guard !permissionUIActive, !permission.requesting else { return }
+        permissionUIActive = true
+        defer { permissionUIActive = false; refreshPermission() }
+        refreshPermission()
+        presentPermissionGuidance()
+    }
+    private func presentPermissionGuidance() {
+        let ready = permission.refresh()
+        let alert = NSAlert()
+        alert.messageText = ready ? "屏幕录制权限已授权" : "尚未获得屏幕录制权限"
+        alert.informativeText = ready
+            ? "可以按 ⌘⇧O 开始识别。若刚授权后仍无法截图，可先复制需保留的结果，再退出并重新打开 FastOCR。"
+            : "FastOCR 在你触发识别时读取屏幕画面，供你框选并在本机识别，不保存或上传截图。\n\n请在系统设置 → 隐私与安全性 → 屏幕录制（部分版本称「屏幕与系统音频录制」）中允许当前 FastOCR。系统可能仍在等待你的选择；此状态不代表你曾拒绝。\n\n返回后会重新检查。若授权后仍无法使用，可先保留结果，再手动重启应用。"
+        if !ready && !permission.requestedThisSession {
+            alert.addButton(withTitle: "申请访问")
+        } else {
+            alert.addButton(withTitle: "打开系统设置")
+        }
+        alert.addButton(withTitle: "完成")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn {
+            if !ready && !permission.requestedThisSession {
+                if permission.request() {
+                    showAlert("权限已就绪", "按 ⌘⇧O 开始识别。")
+                } else {
+                    // Keep the system prompt independent; do not automatically navigate away.
+                    let help = NSAlert()
+                    help.messageText = "请完成系统授权"
+                    help.informativeText = "若系统没有显示提示或权限仍未开启，可打开系统设置手动允许 FastOCR。"
+                    help.addButton(withTitle: "打开系统设置")
+                    help.addButton(withTitle: "稍后")
+                    if help.runModal() == .alertFirstButtonReturn { openPermissions() }
+                }
+            } else { openPermissions() }
+        }
+    }
+    @objc private func revealApplication() {
+        NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
+    }
+    private func openPermissions() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"),
+              NSWorkspace.shared.open(url) else {
+            showAlert("请手动打开系统设置", "系统设置 → 隐私与安全性 → 屏幕录制。可从菜单栏选择「在 Finder 中定位当前应用」，确认授权的是当前使用的 FastOCR。")
+            return
         }
     }
     @objc private func showAbout() {
