@@ -17,13 +17,14 @@ public protocol OCREngine {
     func recognize(image: CGImage) async throws -> OCRResult
 }
 public struct VisionOCREngine: OCREngine {
-    public init() {}
+    public let languages: [String]
+    public init(languages: [String] = ["zh-Hans", "zh-Hant", "en-US", "ja-JP"]) { self.languages = languages }
     public func recognize(image: CGImage) async throws -> OCRResult {
         try await Task.detached(priority: .userInitiated) {
             let start = Date()
             let request = VNRecognizeTextRequest()
             request.recognitionLevel = .accurate
-            request.recognitionLanguages = ["zh-Hans", "zh-Hant", "en-US"]
+            request.recognitionLanguages = languages
             request.usesLanguageCorrection = true
             request.automaticallyDetectsLanguage = true
             try VNImageRequestHandler(cgImage: image).perform([request])

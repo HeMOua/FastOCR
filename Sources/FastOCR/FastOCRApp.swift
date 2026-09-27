@@ -25,6 +25,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var captureItem: NSMenuItem!
     private var resultItem: NSMenuItem!
     private var screenObserver: NSObjectProtocol?
+    private let subtitles = SubtitleController()
+    private var subtitlePauseItem: NSMenuItem!
+    private var subtitleStopItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -33,13 +36,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.applicationIconImage = icon
         }
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        status.button?.image = NSImage(systemSymbolName: "text.viewfinder", accessibilityDescription: "FastOCR")
-        status.button?.toolTip = "FastOCR · ⌘⇧O 框选识别"
+        status.button?.image = NSImage(systemSymbolName: "captions.bubble", accessibilityDescription: "FastOCR 实时翻译")
+        status.button?.toolTip = "FastOCR · 应用音频与字幕实时翻译 · ⌘⇧O 截图取字"
         let menu = NSMenu()
         menu.autoenablesItems = false
-        let title = NSMenuItem(title: "FastOCR · 屏幕文字，一框即得", action: nil, keyEquivalent: "")
+        let title = NSMenuItem(title: "FastOCR · 实时翻译助手", action: nil, keyEquivalent: "")
         title.isEnabled = false
         menu.addItem(title)
+        menu.addItem(.separator())
+        menu.addItem(item("实时翻译…", #selector(showSubtitleSettings)))
+        subtitlePauseItem = item("暂停翻译", #selector(toggleSubtitlePause))
+        subtitleStopItem = item("结束翻译", #selector(stopSubtitles))
+        menu.addItem(subtitlePauseItem)
+        menu.addItem(subtitleStopItem)
+        subtitles.onSelect = { [weak self] in self?.selectSubtitleRegion() }
+        subtitles.onStartAudio = { [weak self] in self?.startApplicationAudio() }
+        subtitles.onStateChange = { [weak self] in self?.updateSubtitleMenu() }
+        updateSubtitleMenu()
         menu.addItem(.separator())
         captureItem = item("框选识别", #selector(startCapture), key: "o")
         captureItem.keyEquivalentModifierMask = [.command, .shift]
@@ -65,11 +78,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         screenObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
             object: nil, queue: .main) { [weak self] _ in
-                Task { @MainActor in self?.captureTask?.cancel(); self?.capture.cancel() }
+                Task { @MainActor in
+                    self?.captureTask?.cancel(); self?.capture.cancel()
+                    self?.subtitles.screenConfigurationChanged()
+                }
             }
         if !UserDefaults.standard.bool(forKey: "hasLaunched") {
             UserDefaults.standard.set(true, forKey: "hasLaunched")
-            showAlert("欢迎使用 FastOCR", "按 ⌘⇧O 或点击菜单栏图标开始框选文字。\n\n首次使用需要允许屏幕录制。识别在本机完成，默认自动复制；Esc 取消选区。")
+            subtitles.showSettings()
         }
     }
     private var autoCopy: Bool {
@@ -103,6 +119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         previousApp = NSWorkspace.shared.frontmostApplication
+        if subtitles.isActive && !subtitles.isPaused { subtitles.pause() }
         setBusy(true)
         preparing = true
         status.button?.title = " 准备中…"
@@ -185,6 +202,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         captureItem.isEnabled = !value
         captureItem.title = value ? "正在处理…" : "框选识别"
         status.button?.appearsDisabled = value
+        updateSubtitleMenu()
+    }
+    @objc private func showSubtitleSettings() { subtitles.showSettings() }
+    @objc private func toggleSubtitlePause() { subtitles.togglePause() }
+    @objc private func stopSubtitles() { subtitles.stop() }
+    private func updateSubtitleMenu() {
+        subtitlePauseItem?.isEnabled = subtitles.isActive && !busy
+        subtitleStopItem?.isEnabled = subtitles.isActive && !busy
+        subtitlePauseItem?.title = subtitles.isPaused ? "继续翻译" : "暂停翻译"
+        if !busy { status.button?.title = subtitles.isActive ? (subtitles.isPaused ? " 暂停" : " 译") : "" }
+    }
+    private func startApplicationAudio() {
+        guard !busy, !permissionUIActive, !permission.requesting else { return }
+        subtitles.refreshModels()
+        do { try subtitles.validateAudio() }
+        catch { subtitles.report(error.localizedDescription); subtitles.showSettings(); return }
+        // ScreenCaptureKit system audio shares the screen-capture authorization on macOS 14.
+        if !permission.refresh() {
+            permissionUIActive = true
+            defer { permissionUIActive = false; refreshPermission() }
+            if !permission.requestedThisSession, permission.request() { }
+            else { presentPermissionGuidance(); return }
+        }
+        subtitles.startAudio()
+    }
+    private func selectSubtitleRegion() {
+        guard !busy, !permissionUIActive, !permission.requesting else { return }
+        subtitles.refreshModels()
+        do { try subtitles.validate() }
+        catch { subtitles.report(error.localizedDescription); subtitles.showSettings(); return }
+        if !permission.refresh() {
+            permissionUIActive = true
+            defer { permissionUIActive = false; refreshPermission() }
+            if !permission.requestedThisSession, permission.request() { }
+            else { presentPermissionGuidance(); return }
+        }
+        let resumeOnCancel = subtitles.isActive && !subtitles.isPaused
+        subtitles.pause()
+        subtitles.hideSettings()
+        hudTask?.cancel(); hud?.orderOut(nil); resultWindow?.orderOut(nil)
+        previousApp = NSWorkspace.shared.frontmostApplication
+        setBusy(true)
+        preparing = true
+        status.button?.title = " 准备中…"
+        captureTask = Task {
+            do {
+                await Task.yield()
+                let snapshots = try await capture.prepare()
+                try Task.checkCancellation()
+                preparing = false
+                capture.selectRegion(snapshots) { [weak self] result in
+                    guard let self else { return }
+                    self.setBusy(false)
+                    self.previousApp?.activate(options: [])
+                    switch result {
+                    case .success(let selection):
+                        if let selection { self.subtitles.start(selection) }
+                        else if resumeOnCancel { self.subtitles.togglePause() }
+                    case .failure(let error):
+                        self.subtitles.report(error.localizedDescription)
+                        self.subtitles.showSettings()
+                    }
+                }
+            } catch is CancellationError { setBusy(false) }
+            catch {
+                setBusy(false)
+                subtitles.report(error.localizedDescription)
+                subtitles.showSettings()
+            }
+        }
     }
     @discardableResult private func copyText(_ text: String) -> Bool {
         let start = ProcessInfo.processInfo.systemUptime
@@ -272,8 +359,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let alert = NSAlert()
         alert.messageText = ready ? "屏幕录制权限已授权" : "尚未获得屏幕录制权限"
         alert.informativeText = ready
-            ? "可以按 ⌘⇧O 开始识别。若刚授权后仍无法截图，可先复制需保留的结果，再退出并重新打开 FastOCR。"
-            : "FastOCR 在你触发识别时读取屏幕画面，供你框选并在本机识别，不保存或上传截图。\n\n请在系统设置 → 隐私与安全性 → 屏幕录制（部分版本称「屏幕与系统音频录制」）中允许当前 FastOCR。系统可能仍在等待你的选择；此状态不代表你曾拒绝。\n\n返回后会重新检查。若授权后仍无法使用，可先保留结果，再手动重启应用。"
+            ? "可以从实时翻译中选择应用开始监听，也可按 ⌘⇧O 框选取字。若刚授权后仍无法使用，可先保留需要的结果，再退出并重新打开 FastOCR。"
+            : "FastOCR 仅在你点击开始后捕获所选应用的播放声音，或读取你框选的屏幕字幕。不启用麦克风，不保存录音或截图。语音和文字识别在本机完成；选择百度翻译时只发送识别文字。\n\n请在系统设置 → 隐私与安全性 → 屏幕录制（部分版本称「屏幕与系统音频录制」）中允许当前 FastOCR。系统可能仍在等待你的选择；此状态不代表你曾拒绝。\n\n返回后会重新检查，需要再次点击开始。若授权后仍无法使用，可手动重启应用。"
         if !ready && !permission.requestedThisSession {
             alert.addButton(withTitle: "申请访问")
         } else {
@@ -284,7 +371,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if alert.runModal() == .alertFirstButtonReturn {
             if !ready && !permission.requestedThisSession {
                 if permission.request() {
-                    showAlert("权限已就绪", "按 ⌘⇧O 开始识别。")
+                    showAlert("权限已就绪", "请再次点击开始监听，或按 ⌘⇧O 框选识别。")
                 } else {
                     // Keep the system prompt independent; do not automatically navigate away.
                     let help = NSAlert()
@@ -308,7 +395,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     @objc private func showAbout() {
-        showAlert("FastOCR " + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.1"), "屏幕文字，一框即得。\n\n⌘⇧O：框选识别\nEsc：取消\n支持中英文、Retina 和多显示器（在单个屏幕内框选）。\n\n基于 Apple Vision，本地识别。只在内存保留上次成功结果，退出即清除。")
+        showAlert("FastOCR " + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.1"), "应用语音与屏幕字幕，实时翻译。\n\n选择一个应用监听播放声音，或框选字幕区域。支持中、英、日语及简繁中文输出。语音识别在本机完成；可选离线或百度机器翻译。\n\n⌘⇧O：框选取字；Esc：取消。\n不启用麦克风，不保存录音。")
     }
     private func showAlert(_ title: String, _ message: String) {
         let alert = NSAlert()
@@ -317,6 +404,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
     }
+    func applicationWillTerminate(_ notification: Notification) { subtitles.stop() }
     @objc private func quit() { NSApp.terminate(nil) }
 }
 struct ResultView: View {

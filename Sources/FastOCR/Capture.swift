@@ -7,6 +7,14 @@ struct ScreenSnapshot {
     let screen: NSScreen
     let image: CGImage
 }
+struct CaptureSelection {
+    let image: CGImage
+    let screen: NSScreen
+    let rect: CGRect
+    var displayID: CGDirectDisplayID {
+        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
+    }
+}
 enum CaptureError: LocalizedError {
     case noDisplays, cropFailed
     var errorDescription: String? {
@@ -20,7 +28,7 @@ enum CaptureError: LocalizedError {
 final class CaptureCoordinator {
     private var panels: [SelectionPanel] = []
     private var monitor: Any?
-    private var completion: ((Result<CGImage?, Error>) -> Void)?
+    private var completion: ((Result<CaptureSelection?, Error>) -> Void)?
     private let logger = Logger(subsystem: "com.chenchao.FastOCR", category: "performance")
     func prepare() async throws -> [ScreenSnapshot] {
         let began = ProcessInfo.processInfo.systemUptime
@@ -56,6 +64,9 @@ final class CaptureCoordinator {
         return images.map { ScreenSnapshot(screen: screens[$0.0], image: $0.1) }
     }
     func select(_ snapshots: [ScreenSnapshot], completion: @escaping (Result<CGImage?, Error>) -> Void) {
+        selectRegion(snapshots) { result in completion(result.map { $0?.image }) }
+    }
+    func selectRegion(_ snapshots: [ScreenSnapshot], completion: @escaping (Result<CaptureSelection?, Error>) -> Void) {
         self.completion = completion
         for snapshot in snapshots {
             let panel = SelectionPanel(contentRect: snapshot.screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
@@ -75,7 +86,7 @@ final class CaptureCoordinator {
                     self.finish(.failure(CaptureError.cropFailed))
                     return
                 }
-                self.finish(.success(image))
+                self.finish(.success(CaptureSelection(image: image, screen: snapshot.screen, rect: rect)))
             }
             panel.contentView = view
             panels.append(panel)
@@ -90,7 +101,7 @@ final class CaptureCoordinator {
         }
     }
     func cancel() { finish(.success(nil)) }
-    private func finish(_ image: Result<CGImage?, Error>) {
+    private func finish(_ image: Result<CaptureSelection?, Error>) {
         if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }
         panels.forEach { $0.orderOut(nil) }
         panels.removeAll()

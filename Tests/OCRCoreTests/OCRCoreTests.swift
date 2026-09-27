@@ -35,6 +35,10 @@ final class OCRCoreTests: XCTestCase {
         let result = try await VisionOCREngine().recognize(image: fixture(text: ""))
         XCTAssertTrue(result.text.isEmpty)
     }
+    func testJapaneseVisionRecognition() async throws {
+        let result = try await VisionOCREngine(languages: ["ja-JP", "en-US"]).recognize(image: fixture(text: "今日はいい天気ですね"))
+        XCTAssertTrue(result.text.contains("天気"), result.text)
+    }
     private func fixture(text: String) throws -> CGImage {
         let bitmap = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 1000, pixelsHigh: 300,
             bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
