@@ -162,13 +162,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 resultItem.isEnabled = true
                 if shouldCopy {
                     if copyText(result.text) {
-                        showHUD("已复制 \(result.text.count) 个字符", symbol: "checkmark.circle.fill", preview: result.text, seconds: 6)
+                        showHUD("已复制 \(result.text.count) 个字符", symbol: "checkmark.circle.fill", preview: result.text)
                     } else {
-                        showHUD("复制失败，请从结果窗口复制", symbol: "exclamationmark.triangle", preview: result.text, seconds: 6)
+                        showHUD("复制失败，可在此处复制", symbol: "exclamationmark.triangle", preview: result.text)
                         showResult()
                     }
                 } else {
-                    showHUD("识别完成 · \(result.text.count) 个字符", symbol: "checkmark.circle.fill", preview: result.text, seconds: 6)
+                    showHUD("识别完成 · \(result.text.count) 个字符", symbol: "checkmark.circle.fill", preview: result.text)
                     showResult()
                 }
             } catch {
@@ -212,38 +212,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hud?.orderOut(nil)
         let width: CGFloat = preview == nil ? 330 : 380
         let height: CGFloat = preview == nil ? 72 : 210
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+        let panel = ResultHUDPanel(contentRect: NSRect(x: 0, y: 0, width: width, height: height),
                             styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.level = .statusBar
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.ignoresMouseEvents = true
+        panel.ignoresMouseEvents = preview == nil
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        panel.contentView = NSHostingView(rootView:
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 12) {
-                    Image(systemName: symbol).font(.system(size: 23)).foregroundStyle(.blue)
-                    Text(text).font(.system(size: 14, weight: .medium))
-                    Spacer(minLength: 0)
-                }
-                if let preview {
-                    Divider()
-                    Text(String(preview.prefix(600)))
-                        .font(.system(size: 13)).lineSpacing(3)
-                        .lineLimit(4).truncationMode(.tail)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    Spacer(minLength: 0)
-                    Text("菜单栏 → 查看上次结果，可阅读完整内容")
-                        .font(.system(size: 11)).foregroundStyle(.secondary)
-                }
-            }.padding(20).frame(width: width, height: height, alignment: .topLeading)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16)))
-        if let screen = captureScreen ?? NSScreen.main {
+        let screen = captureScreen ?? NSScreen.main
+        let expandedHeight = min(max(300, (screen?.visibleFrame.height ?? 700) - 48), 560)
+        panel.contentView = NSHostingView(rootView: ResultHUDView(title: text, symbol: symbol, preview: preview,
+            expandedHeight: expandedHeight, copy: { [weak self] in self?.copyText($0) ?? false },
+            resize: { [weak panel] expanded in
+                guard let panel else { return }
+                if expanded { self.hudTask?.cancel() }
+                let newHeight = expanded ? expandedHeight : height
+                let newWidth: CGFloat = expanded ? 520 : width
+                let visible = screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? panel.frame
+                let x = min(max(panel.frame.maxX - newWidth, visible.minX), visible.maxX - newWidth)
+                let y = min(max(panel.frame.minY, visible.minY), visible.maxY - newHeight)
+                panel.setFrame(NSRect(x: x, y: y, width: newWidth, height: newHeight),
+                               display: true, animate: true)
+            }, drag: { [weak panel] in
+                guard let panel else { return }
+                if panel.dragWithMouse() { self.hudTask?.cancel() }
+            }, endDrag: { [weak panel] in panel?.endDrag() },
+            close: { [weak panel] in panel?.orderOut(nil) }))
+        if let screen {
             panel.setFrameOrigin(NSPoint(x: screen.visibleFrame.maxX - width - 24, y: screen.visibleFrame.minY + 24))
         }
         panel.orderFrontRegardless()
         hud = panel
-        if let seconds {
+        if let seconds = preview == nil ? seconds : 6 {
             hudTask = Task { [weak panel] in
                 do { try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000)) }
                 catch { return }
@@ -348,6 +348,96 @@ struct ResultView: View {
         .alert("复制失败", isPresented: $copyFailed) {
             Button("好", role: .cancel) {}
         } message: { Text("剪贴板写入或校验失败，请重试复制。识别结果仍保留在窗口中。") }
+    }
+}
+
+private final class ResultHUDPanel: NSPanel {
+    private var dragOrigin: NSPoint?
+    private var dragMouseOrigin: NSPoint?
+    override var canBecomeKey: Bool { true }
+
+    func dragWithMouse() -> Bool {
+        let mouse = NSEvent.mouseLocation
+        if dragOrigin == nil {
+            dragOrigin = frame.origin
+            dragMouseOrigin = mouse
+            return false
+        }
+        guard let origin = dragOrigin, let start = dragMouseOrigin else { return false }
+        let dx = mouse.x - start.x
+        let dy = mouse.y - start.y
+        setFrameOrigin(NSPoint(x: origin.x + dx, y: origin.y + dy))
+        return abs(dx) + abs(dy) > 3
+    }
+
+    func endDrag() {
+        dragOrigin = nil
+        dragMouseOrigin = nil
+    }
+}
+
+private struct ResultHUDView: View {
+    let title: String
+    let symbol: String
+    let preview: String?
+    let expandedHeight: CGFloat
+    let copy: (String) -> Bool
+    let resize: (Bool) -> Void
+    let drag: () -> Void
+    let endDrag: () -> Void
+    let close: () -> Void
+    @State private var expanded = false
+    @State private var copied = false
+    @State private var copyFailed = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                HStack(spacing: 10) {
+                    Image(systemName: symbol).font(.system(size: 22)).foregroundStyle(.blue)
+                    Text(title).font(.system(size: 14, weight: .medium))
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+                .gesture(DragGesture(minimumDistance: 2)
+                    .onChanged { _ in drag() }
+                    .onEnded { _ in endDrag() })
+                if preview != nil {
+                    Button(action: close) { Image(systemName: "xmark") }
+                        .buttonStyle(.plain).help("关闭提示")
+                }
+            }
+            if let preview {
+                Divider()
+                ScrollView {
+                    Text(expanded ? preview : String(preview.prefix(600)))
+                        .font(.system(size: 13)).lineSpacing(3)
+                        .lineLimit(expanded ? nil : 4)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: .infinity)
+                HStack {
+                    Button(expanded ? "收起" : "展开全文") {
+                        expanded.toggle()
+                        resize(expanded)
+                    }
+                    Button(copied ? "已复制" : "复制全文") {
+                        copied = copy(preview)
+                        copyFailed = !copied
+                    }
+                    Spacer()
+                    Text("可选中文字复制").font(.system(size: 11)).foregroundStyle(.secondary)
+                }.buttonStyle(.borderless)
+            }
+        }
+        .padding(20)
+        .frame(width: expanded ? 520 : (preview == nil ? 330 : 380),
+               height: expanded ? expandedHeight : (preview == nil ? 72 : 210), alignment: .topLeading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .alert("复制失败", isPresented: $copyFailed) {
+            Button("好", role: .cancel) {}
+        } message: { Text("剪贴板写入失败，请选中文字后按 ⌘C，或打开完整结果窗口重试。") }
     }
 }
 @main
